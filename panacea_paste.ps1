@@ -22,6 +22,7 @@ $Panacea = [ordered]@{
     PromptDose     = $true         # if interactive, ask before administering updates
     RunWinSxS      = $true         # run DISM StartComponentCleanup during PURGE
     ShowSetup      = $true         # show the interactive configure panel before DIAGNOSE
+    DisableFastBoot = $false       # turn off Windows Fast Startup (HiberbootEnabled=0) during TONIC
     # long-running operation ceilings (seconds) — 0 = infinite (default; rely on Windows).
     # slow boxes are the norm; the S-key still gives instant bail on any long op.
     DismCheckTimeoutSec   = 0
@@ -177,6 +178,11 @@ function Show-Setup {
             $toV = "{0,-4}m" -f $mins
             $toHint = "kills stuck operations after $mins min"
         }
+        if ($Panacea.DisableFastBoot) {
+            $fbV = 'ON '; $fbHint = 'will turn off Windows Fast Startup'
+        } else {
+            $fbV = 'OFF'; $fbHint = 'will leave Fast Startup as it is'
+        }
         $rbV = "{0,-4}" -f $Panacea.RebootPolicy
         if ($Panacea.RebootPolicy -eq 'warn') {
             $rbHint = 'runs even if reboot is already pending'
@@ -189,6 +195,7 @@ function Show-Setup {
         Write-Host (Paint "   [3] WinSxS cleanup .... $wsxV   $wsxHint" -Fg $Clr.Grey)
         Write-Host (Paint "   [4] Timeouts .......... $toV  $toHint" -Fg $Clr.Grey)
         Write-Host (Paint "   [5] Reboot policy ..... $rbV  $rbHint" -Fg $Clr.Grey)
+        Write-Host (Paint "   [6] Disable fast boot . $fbV   $fbHint" -Fg $Clr.Grey)
         Write-Host ''
         Write-Host (Paint "   [Enter] proceed  ·  [Q] quit" -Fg $Clr.Cyan)
         Write-Host (Paint "    > " -Fg $Clr.Cyan) -NoNewline
@@ -234,6 +241,7 @@ function Show-Setup {
         elseif ($c -eq '5') {
             $Panacea.RebootPolicy = if ($Panacea.RebootPolicy -eq 'warn') { 'stop' } else { 'warn' }
         }
+        elseif ($c -eq '6') { $Panacea.DisableFastBoot = -not $Panacea.DisableFastBoot }
         # anything else: silently redraw
     }
 }
@@ -1048,6 +1056,38 @@ $reclaimed = [Math]::Round($reclaimed,2)
 Status $G.Ok 'sacred' 'user files + recycle bin — untouched, always' $Clr.Green
 
 # ═══════════════════════════════════════════════════════════════
+#  TONIC  —  opt-in system tweaks. off unless enabled in config.
+# ═══════════════════════════════════════════════════════════════
+Rule 'TONIC'
+$fastBoot = 'not changed'
+# Fast Startup = hybrid shutdown. it skips a real kernel restart on "Shut down",
+# so uptime lies and pending fixes linger. takes effect on the next shutdown, no reboot needed.
+$fbKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power'
+if ($Panacea.DisableFastBoot) {
+    try {
+        $fbNow = (Get-ItemProperty $fbKey -Name HiberbootEnabled -ErrorAction SilentlyContinue).HiberbootEnabled
+        if ($fbNow -eq 0) {
+            Status $G.Ok 'fast boot' 'already disabled' $Clr.Green
+            $fastBoot = 'already off'
+        } elseif ($Panacea.DryRun) {
+            Status $G.Skip 'fast boot' 'would disable Fast Startup (DRY RUN)' $Clr.Grey
+            $fastBoot = 'would disable'
+        } else {
+            if (-not (Test-Path $fbKey)) { New-Item -Path $fbKey -Force | Out-Null }
+            Set-ItemProperty -Path $fbKey -Name HiberbootEnabled -Value 0 -Type DWord -ErrorAction Stop
+            Status $G.Ok 'fast boot' 'disabled — applies from next shutdown' $Clr.Cyan
+            $fastBoot = 'disabled'
+        }
+    } catch {
+        Status $G.Fail 'fast boot' "could not disable: $($_.Exception.Message.Split("`n")[0])" $Clr.Red
+        $script:Ledger.Warnings.Add('fast boot disable failed')
+        $fastBoot = 'failed'
+    }
+} else {
+    Status $G.Skip 'fast boot' 'disabled in config' $Clr.Grey
+}
+
+# ═══════════════════════════════════════════════════════════════
 #  PROGNOSIS  —  the label's warning strip. plain roll-up,
 #                conditional orange sticker, screaming reboot line.
 # ═══════════════════════════════════════════════════════════════
@@ -1177,6 +1217,7 @@ $summary = [ordered]@{
     dell          = $dellState
     hp            = $hpState
     reclaimed_gb  = $reclaimed
+    fast_boot     = $fastBoot
     reboot_req    = $rebootNeeded
     symptoms      = @($script:Ledger.Symptoms)
     status        = ($tag -replace '[^A-Za-z]','')
