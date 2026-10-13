@@ -31,6 +31,10 @@ $Panacea = [ordered]@{
     SfcTimeoutSec         = 0
     VendorTimeoutSec      = 0
     WinSxSTimeoutSec      = 0
+    # the one ceiling that is NOT infinite: a Windows Update download that has not
+    # finished in two hours is stuck, not slow. Panacea stops waiting, installs
+    # nothing, and points at ALKAHEST. independent of the [4] Timeouts cycle.
+    WuDownloadTimeoutSec  = 7200
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -561,6 +565,174 @@ function Invoke-Guarded {
 }
 
 # ═══════════════════════════════════════════════════════════════
+#  WU RUNNER  —  Windows Update search/download/install on a worker
+#               thread, so a stuck download can be walked away from
+# ═══════════════════════════════════════════════════════════════
+# WUA's Download() blocks until Windows Update gives up, which on a wedged
+# stack is never. BeginDownload would fix that but needs a compiled COM
+# callback (Add-Type → csc.exe, an EDR-flagged LOLBin), so the plain calls run
+# in their own runspace and this thread watches the clock instead. Every WUA
+# object is created and used on that one worker thread; no COM crosses threads.
+# Same contract as Invoke-Guarded: S skips, a ceiling of 0 means infinite.
+# Mode: 'search' (report only) · 'download' (stage, no install) · 'install'
+function Invoke-WuPipeline {
+    param(
+        [ValidateSet('search','download','install')][string]$Mode = 'install',
+        [int]$DownloadTimeoutSec = 7200,
+        [string]$Label = 'windows update'
+    )
+    $state = [hashtable]::Synchronized(@{
+        Phase = 'search'; PhaseStarted = [DateTime]::UtcNow; Abandon = $false
+        SearchMs = 0; Found = @(); Downloaded = @(); Failed = @()
+        InstallCode = -1; RebootRequired = $false; Error = $null
+    })
+
+    $work = {
+        param($state, $mode)
+        # phase change and the watcher's abandon decision share one lock, so the
+        # worker can never start installing in the gap after the watcher gave up
+        function Enter-Phase($name) {
+            [System.Threading.Monitor]::Enter($state.SyncRoot)
+            try {
+                if ($state.Abandon) { return $false }
+                $state.Phase = $name; $state.PhaseStarted = [DateTime]::UtcNow
+                return $true
+            } finally { [System.Threading.Monitor]::Exit($state.SyncRoot) }
+        }
+        try {
+            $session  = New-Object -ComObject Microsoft.Update.Session
+            $searcher = $session.CreateUpdateSearcher()
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            # IsInstalled=0, software type, not hidden. Drivers & feature-upgrades fenced off by default.
+            $res = $searcher.Search("IsInstalled=0 and Type='Software' and IsHidden=0")
+            $sw.Stop(); $state.SearchMs = [int]$sw.ElapsedMilliseconds
+
+            $coll = New-Object -ComObject Microsoft.Update.UpdateColl
+            $kbs  = @()
+            foreach ($u in $res.Updates) {
+                # hard-exclude feature/upgrade packages — a paste tool never rides a build upgrade
+                if ($u.Title -match 'Feature update|Upgrade to Windows|\b2[0-9]H[12]\b') { continue }
+                [void]$coll.Add($u)
+                $kb = ($u.KBArticleIDs | ForEach-Object { "KB$_" }) -join ','
+                if (-not $kb) { $kb = '(no KB)' }
+                $kbs += $kb
+            }
+            $state.Found = $kbs
+            if ($mode -eq 'search' -or $coll.Count -eq 0) { return }
+
+            if (-not (Enter-Phase 'download')) { return }
+            $dl = $session.CreateUpdateDownloader(); $dl.Updates = $coll
+            $dlRes = $dl.Download()
+
+            # read every update's own verdict — the batch code can say "succeeded"
+            # with half the payloads missing, and installing those is what wedges
+            $ready = New-Object -ComObject Microsoft.Update.UpdateColl
+            $okKbs = @(); $badKbs = @()
+            for ($i = 0; $i -lt $coll.Count; $i++) {
+                $u = $coll.Item($i)
+                $r = $dlRes.GetUpdateResult($i)
+                # ResultCode 2 = succeeded, 3 = succeeded w/ errors
+                if ($r.ResultCode -eq 2 -or $r.ResultCode -eq 3 -or $u.IsDownloaded) {
+                    [void]$ready.Add($u); $okKbs += $kbs[$i]
+                } else {
+                    $badKbs += ('{0} (0x{1:X8})' -f $kbs[$i], $r.HResult)
+                }
+            }
+            $state.Downloaded = $okKbs; $state.Failed = $badKbs
+            if ($mode -eq 'download' -or $ready.Count -eq 0) { return }
+
+            if (-not (Enter-Phase 'install')) { return }
+            # install (reboot suppressed — WUA won't force restart from here)
+            $inst = $session.CreateUpdateInstaller(); $inst.Updates = $ready
+            $instRes = $inst.Install()
+            $state.InstallCode    = [int]$instRes.ResultCode
+            $state.RebootRequired = [bool]$instRes.RebootRequired
+        } catch {
+            $state.Error = $_.Exception.Message.Split("`n")[0]
+        }
+    }
+
+    $rs = [runspacefactory]::CreateRunspace()
+    $rs.ApartmentState = 'STA'          # the apartment the console thread gave WUA before
+    $rs.ThreadOptions  = 'ReuseThread'
+    $rs.Open()
+    $ps = [powershell]::Create(); $ps.Runspace = $rs
+    [void]$ps.AddScript($work.ToString()).AddArgument($state).AddArgument($Mode)
+    $handle = $ps.BeginInvoke()
+
+    $canSkip = $false
+    try { $canSkip = -not [Console]::IsInputRedirected } catch { $canSkip = $false }
+    if ($script:VT) { $frames = @([char]0x280B,[char]0x2819,[char]0x2839,[char]0x2838,[char]0x283C,[char]0x2834,[char]0x2826,[char]0x2827,[char]0x2807,[char]0x280F) }
+    else            { $frames = @('|','/','-','\') }
+    $frameIdx = 0; $seen = 'search'; $outcome = 'done'
+
+    while (-not $handle.IsCompleted) {
+        $phase = $state.Phase
+        if ($phase -ne $seen) {
+            try { [Console]::Write("`r" + (' ' * 72) + "`r") } catch {}
+            if ($phase -eq 'download') { Status $G.Work $Label "$($state.Found.Count) found → downloading..." $Clr.Cyan }
+            if ($phase -eq 'install')  { Status $G.Work $Label "$($state.Downloaded.Count) downloaded → installing (reboot suppressed)..." $Clr.Cyan }
+            $seen = $phase
+        }
+        $inPhase = [DateTime]::UtcNow - $state.PhaseStarted
+
+        $giveUp = $null
+        if ($phase -eq 'download' -and $DownloadTimeoutSec -gt 0 -and $inPhase.TotalSeconds -ge $DownloadTimeoutSec) { $giveUp = 'stalled' }
+        if ($canSkip -and $phase -ne 'install') {
+            try {
+                if ([Console]::KeyAvailable) {
+                    $k = [Console]::ReadKey($true)
+                    if ($k.KeyChar -eq 's' -or $k.KeyChar -eq 'S') { $giveUp = 'skipped' }
+                }
+            } catch {}
+        }
+        if ($giveUp) {
+            # an install already under way is never abandoned — walking off mid-install
+            # would report "skipped" while Windows keeps installing behind our back
+            [System.Threading.Monitor]::Enter($state.SyncRoot)
+            try {
+                if ($state.Phase -ne 'install') { $state.Abandon = $true; $outcome = $giveUp }
+            } finally { [System.Threading.Monitor]::Exit($state.SyncRoot) }
+            if ($state.Abandon) { break }
+        }
+
+        $elapsed = "{0:mm\:ss}" -f $inPhase
+        $spin = $frames[$frameIdx % $frames.Count]
+        if ($phase -eq 'install') { $hint = 'installing — not skippable' }
+        elseif ($canSkip)         { $hint = 'press S to skip' }
+        else                      { $hint = 'running' }
+        $line = "      $spin  $Label · $phase  ·  $elapsed  ·  $hint"
+        try { [Console]::Write("`r" + $line.PadRight(70)) } catch {}
+        $frameIdx++
+        Start-Sleep -Milliseconds 250
+    }
+    try { [Console]::Write("`r" + (' ' * 72) + "`r") } catch {}
+
+    $phaseSec = [int]([DateTime]::UtcNow - $state.PhaseStarted).TotalSeconds
+    if ($outcome -eq 'done') {
+        try { [void]$ps.EndInvoke($handle) } catch { if (-not $state.Error) { $state.Error = $_.Exception.Message.Split("`n")[0] } }
+        try { $ps.Dispose(); $rs.Dispose() } catch {}
+    } else {
+        # the worker is parked inside a WUA call nothing can cancel from here.
+        # ask it to stop and leave it — Dispose would block on that same call.
+        try { [void]$ps.BeginStop($null, $null) } catch {}
+    }
+
+    [pscustomobject]@{
+        Outcome        = $outcome          # done | stalled | skipped
+        Phase          = $state.Phase      # where it was when it ended
+        PhaseSec       = $phaseSec
+        SearchMs       = $state.SearchMs
+        Found          = @($state.Found)
+        Downloaded     = @($state.Downloaded)
+        Failed         = @($state.Failed)  # 'KBnnnn (0xHRESULT)'
+        InstallCode    = $state.InstallCode
+        RebootRequired = $state.RebootRequired
+        Error          = $state.Error
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════
 #  MEND  —  DISM spine, then SFC off the healed store
 # ═══════════════════════════════════════════════════════════════
 # NOTE: DISM verdict parsing below matches English strings ("No component store
@@ -742,6 +914,7 @@ if ($Panacea.PromptDose -and $doseInteractive -and -not $Panacea.DryRun) {
 
 Rule 'DOSE'
 $wuStaged   = 0;  $wuList = @();  $wuState = 'not run'
+$wuFailed   = @(); $wuStuck = $false   # stuck = a download hung or failed; ALKAHEST territory
 $dellStaged = 0;  $dellState = 'n/a'
 $hpStaged   = 0;  $hpState   = 'n/a'
 $doseReboot = $false
@@ -766,27 +939,33 @@ if ($doseWanted) { try {
         }
     } catch { $wuServiceOK = $false }
 
-    $wuSession  = New-Object -ComObject Microsoft.Update.Session
-    $wuSearcher = $wuSession.CreateUpdateSearcher()
-    # time the search — a real Windows Update/WSUS round-trip takes seconds; sub-half-second empty = suspicious
-    $wuSw = [System.Diagnostics.Stopwatch]::StartNew()
-    # IsInstalled=0, software type, not hidden. Drivers & feature-upgrades fenced off by default.
-    $wuResult = $wuSearcher.Search("IsInstalled=0 and Type='Software' and IsHidden=0")
-    $wuSw.Stop()
-    $wuSearchMs = [int]$wuSw.ElapsedMilliseconds
+    # search → download → install on a worker thread; see WU RUNNER above
+    $wuMode = if ($Panacea.DryRun) { 'search' } else { 'install' }
+    $wu = Invoke-WuPipeline -Mode $wuMode -DownloadTimeoutSec $Panacea.WuDownloadTimeoutSec -Label 'windows update'
+    $wuSearchMs = $wu.SearchMs
+    $wuList     = @($wu.Found)
+    $wuFailed   = @($wu.Failed)
+    $wuMins     = [Math]::Round($wu.PhaseSec / 60)
 
-    $toGet = New-Object -ComObject Microsoft.Update.UpdateColl
-    foreach ($u in $wuResult.Updates) {
-        $title = $u.Title
-        # hard-exclude feature/upgrade packages — a paste tool never rides a build upgrade
-        if ($title -match 'Feature update|Upgrade to Windows|\b2[0-9]H[12]\b') { continue }
-        [void]$toGet.Add($u)
-        $kb = ($u.KBArticleIDs | ForEach-Object { "KB$_" }) -join ','
-        if (-not $kb) { $kb = '(no KB)' }
-        $wuList += $kb
-    }
-
-    if ($toGet.Count -eq 0) {
+    if ($wu.Error) {
+        Status $G.Fail 'windows update' "WUA error: $($wu.Error)" $Clr.Red
+        $script:Ledger.Symptoms.Add('Windows Update via WUA failed — check service health')
+        $wuState = 'failed'
+    } elseif ($wu.Outcome -ne 'done' -and $wu.Phase -eq 'download') {
+        # stuck at "downloading" — the exact wedge Settings shows. install NOT attempted.
+        if ($wu.Outcome -eq 'stalled') {
+            Status $G.Fail 'windows update' "download stuck — no finish after $wuMins min, nothing installed" $Clr.Red
+        } else {
+            Status $G.Skip 'windows update' "download skipped by user after $wuMins min — nothing installed" $Clr.Grey
+        }
+        $script:Ledger.Symptoms.Add("Windows Update download stuck ($($wuList.Count) updates)")
+        $wuStuck = $true
+        $wuState = 'download stuck'
+    } elseif ($wu.Outcome -ne 'done') {
+        Status $G.Skip 'windows update' 'search skipped by user' $Clr.Grey
+        $script:Ledger.Warnings.Add('Windows Update search skipped by user')
+        $wuState = 'skipped'
+    } elseif ($wuList.Count -eq 0) {
         # trust check: zero-result + fast + service issues = WUA lied to us
         $wuSuspicious = (-not $wuServiceOK) -or ($wuSearchMs -lt 500)
         if ($wuSuspicious) {
@@ -801,31 +980,33 @@ if ($doseWanted) { try {
             Status $G.Ok 'windows update' "current — nothing to administer (search ${wuSearchMs}ms)" $Clr.Green
             $wuState = 'current'
         }
+    } elseif ($Panacea.DryRun) {
+        $kbList = ($wuList | Select-Object -Unique) -join ', '
+        Status $G.Skip 'windows update' "would administer $($wuList.Count): $kbList (DRY RUN)" $Clr.Grey
+        $wuState = "would install $($wuList.Count)"
     } else {
-        if ($Panacea.DryRun) {
-            $kbList = ($wuList | Select-Object -Unique) -join ', '
-            Status $G.Skip 'windows update' "would administer $($toGet.Count): $kbList (DRY RUN)" $Clr.Grey
-            $wuState = "would install $($toGet.Count)"
+        # only what actually downloaded got installed; name the rest
+        if ($wuFailed.Count -gt 0) {
+            Status $G.Warn 'windows update' "$($wuFailed.Count) of $($wuList.Count) did not download: $($wuFailed -join ', ')" $Clr.Orange
+            $script:Ledger.Symptoms.Add("Windows Update download failed: $($wuFailed -join ', ')")
+            $wuStuck = $true
+        }
+        if ($wu.Downloaded.Count -eq 0) {
+            Status $G.Fail 'windows update' 'nothing downloaded — nothing installed' $Clr.Red
+            $wuState = 'download failed'
         } else {
-        # download
-        Status $G.Work 'windows update' "$($toGet.Count) found → downloading..." $Clr.Cyan
-        $dl = $wuSession.CreateUpdateDownloader(); $dl.Updates = $toGet
-        $dlRes = $dl.Download()
-        # install (reboot suppressed — WUA won't force restart from here)
-        $inst = $wuSession.CreateUpdateInstaller(); $inst.Updates = $toGet
-        $instRes = $inst.Install()
-        $wuStaged = $toGet.Count
-        if ($instRes.RebootRequired) { $doseReboot = $true }
-        # ResultCode 2 = succeeded, 3 = succeeded w/ errors
-        switch ($instRes.ResultCode) {
-            2 { Status $G.Ok   'windows update' "$wuStaged administered" $Clr.Green; $wuState = "$wuStaged installed" }
-            3 { Status $G.Warn 'windows update' "$wuStaged done, some errors" $Clr.Orange; $wuState = "$wuStaged w/ errors" }
-            default {
-                Status $G.Warn 'windows update' "finished, result code $($instRes.ResultCode)" $Clr.Orange
-                $wuState = "code $($instRes.ResultCode)"
+            $wuStaged = $wu.Downloaded.Count
+            if ($wu.RebootRequired) { $doseReboot = $true }
+            # ResultCode 2 = succeeded, 3 = succeeded w/ errors
+            switch ($wu.InstallCode) {
+                2 { Status $G.Ok   'windows update' "$wuStaged administered" $Clr.Green; $wuState = "$wuStaged installed" }
+                3 { Status $G.Warn 'windows update' "$wuStaged done, some errors" $Clr.Orange; $wuState = "$wuStaged w/ errors" }
+                default {
+                    Status $G.Warn 'windows update' "finished, result code $($wu.InstallCode)" $Clr.Orange
+                    $wuState = "code $($wu.InstallCode)"
+                }
             }
         }
-        } # /DryRun else for Windows Update install
     }
 } catch {
     Status $G.Fail 'windows update' "WUA error: $($_.Exception.Message.Split("`n")[0])" $Clr.Red
@@ -1097,7 +1278,7 @@ $rebootNeeded = $doseReboot -or ($rbSources.Count -gt 0) -or ($sfcResult -eq 're
 $totalStaged  = $wuStaged + $dellStaged + $hpStaged
 
 # overall status tag
-if ($script:Ledger.Symptoms.Count -gt 0 -and $mendResult -eq 'failed') {
+if (($script:Ledger.Symptoms.Count -gt 0 -and $mendResult -eq 'failed') -or $wuStuck) {
     $tag = "$($G.Bell) ATTENTION"; $tagColor = $Clr.Orange
 } elseif ($mendResult -eq 'repaired' -or $totalStaged -gt 0 -or $reclaimed -gt 0.1) {
     $tag = "$($G.Staff) FIXED"; $tagColor = $Clr.Cyan
@@ -1134,6 +1315,8 @@ if ($totalStaged -gt 0) {
     if ($dellStaged) { $updBits += 'Dell fw' }
     if ($hpStaged)   { $updBits += 'HP fw' }
     Roll 'updates' ("$totalStaged staged (" + ($updBits -join ', ') + ')')
+} elseif ($wuStuck) {
+    Roll 'updates' 'DOWNLOAD STUCK — nothing installed'
 } elseif ($wuState -eq 'unverified') {
     Roll 'updates' 'UNVERIFIED — Windows Update stack looks off'
 } elseif ($wuState -eq 'current' -and
@@ -1169,6 +1352,7 @@ foreach ($w in $script:Ledger.Warnings) {
 if ($mendResult -eq 'failed') { $auxWarnings += 'CORRUPTION REPAIR FAILED — manual DISM w/ source may be needed' }
 if ($sfcResult -eq 'unfixable') { $auxWarnings += 'SFC FOUND UNFIXABLE DAMAGE — investigate before reimage' }
 if ($wuState -eq 'unverified') { $auxWarnings += 'WINDOWS UPDATE UNVERIFIED — Windows Update stack may be broken; do not trust "current"' }
+if ($wuStuck) { $auxWarnings += 'WINDOWS UPDATE DOWNLOAD STUCK — run ALKAHEST to clear the update cache, then run Panacea again' }
 
 if ($auxWarnings.Count -gt 0) {
     Write-Host (Paint "╟$mid╢" -Fg $Clr.Grey)
@@ -1214,6 +1398,8 @@ $summary = [ordered]@{
     sfc           = $sfcResult
     windows_update    = $wuState
     windows_update_kbs= $wuList
+    windows_update_failed = @($wuFailed)
+    windows_update_stuck  = [bool]$wuStuck
     dell          = $dellState
     hp            = $hpState
     reclaimed_gb  = $reclaimed
@@ -1232,7 +1418,7 @@ try {
 # exit code contract: 0 healthy, 1 reboot-needed, 2 needs-attention
 # stored in $global:PanaceaExit so RMM/scripting can read it; NO exit call so backstage stays alive
 try { Stop-Transcript -ErrorAction SilentlyContinue | Out-Null } catch {}
-if ($mendResult -eq 'failed' -or $sfcResult -eq 'unfixable') { $global:PanaceaExit = 2 }
+if ($mendResult -eq 'failed' -or $sfcResult -eq 'unfixable' -or $wuStuck) { $global:PanaceaExit = 2 }
 elseif ($rebootNeeded) { $global:PanaceaExit = 1 }
 else { $global:PanaceaExit = 0 }
 $exitVal = $global:PanaceaExit
