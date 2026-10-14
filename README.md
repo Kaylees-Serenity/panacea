@@ -29,7 +29,7 @@ Panacea runs in six stages, each named like a step on a prescription label.
 
 ## Built for the real world
 
-- **Won't hang your session.** Every long operation can be skipped with **S**. A Windows Update download that hasn't finished after two hours is treated as stuck: Panacea stops waiting, installs nothing, and tells you so.
+- **Won't hang your session.** Every long operation can be skipped with **S**. A Windows Update download that hasn't finished after two hours is treated as stuck: Panacea stops waiting, installs nothing, and points you at [ALKAHEST](https://github.com/Kaylees-Serenity/Alkahest), its sibling tool for unsticking Windows Update.
 
 - **Doesn't trust a too-good answer.** If Windows Update reports "nothing to install" but the service is down or the search came back suspiciously fast, the result is marked **UNVERIFIED** instead of current.
 
