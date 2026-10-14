@@ -1,6 +1,6 @@
 # ℞ Panacea
 
-**A single-paste Windows tune-up for MSP techs.** Paste it into an elevated PowerShell prompt or a ScreenConnect backstage session, and it checks the machine, repairs the component store, installs updates, clears system junk, and hands you a report you can read in five seconds.
+**A single-paste Windows tune-up for MSP techs.** Paste it into an elevated PowerShell prompt, and it checks the machine, repairs the component store, installs updates, clears system junk, and hands you a report you can read in five seconds.
 
 Native Windows tools only. No modules to install, nothing to download, no compiled code. It never reboots the machine and never touches user files.
 
