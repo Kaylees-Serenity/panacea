@@ -41,7 +41,7 @@ Panacea runs in six stages, each named like a step on a prescription label.
 
 ## Usage
 
-1. Open PowerShell as Administrator, or a ScreenConnect backstage session (runs as SYSTEM).
+1. Open PowerShell as Administrator, or a remote-support shell running as SYSTEM.
 2. Paste the entire contents of `panacea_paste.ps1` and press Enter.
 
 In an interactive session, a setup panel appears first:
@@ -84,7 +84,7 @@ Each run writes two files to `%ProgramData%\Panacea\TuneUp\`:
 - `panacea_<HOST>_<timestamp>.log`, the full transcript
 - `panacea_<HOST>_<timestamp>.json`, a machine-readable summary (join type, repair results, updates installed or failed, space reclaimed, reboot needed, overall status)
 
-The result is also left in `$PanaceaExit` instead of being passed to `exit`, so a backstage session stays open afterwards:
+The result is also left in `$PanaceaExit` instead of being passed to `exit`, so a remote shell stays open afterwards:
 
 | `$PanaceaExit` | Meaning |
 |---|---|
