@@ -4,7 +4,7 @@ $panacea = @'
     ℞ PANACEA — the universal remedy
     DIAGNOSE tier : preflight gate + color engine + Rx banner
     Native-only · non-interactive · fails-closed · single-paste
-    Run from ScreenConnect backstage (SYSTEM) or frontstage admin prompt.
+    Run from a remote-support shell as SYSTEM, or an elevated admin prompt.
 #>
 
 # ═══════════════════════════════════════════════════════════════
@@ -141,7 +141,7 @@ function Show-Banner {
 
 # ═══════════════════════════════════════════════════════════════
 #  SETUP  —  interactive configure panel before infusion begins.
-#             non-interactive contexts (SYSTEM/backstage) skip it.
+#             non-interactive contexts (SYSTEM/remote shell) skip it.
 # ═══════════════════════════════════════════════════════════════
 $script:PanaceaAbort = $false
 function Show-Setup {
@@ -444,7 +444,7 @@ if (-not $script:Ledger.Proceed) {
 Write-Host ''
 Write-Host (Paint "   diagnosis complete — cleared to proceed" -Fg $Clr.Green)
 
-# helper: run a native exe with a timeout so a hung process never strands backstage
+# helper: run a native exe with a timeout so a hung process never strands the remote shell
 function Invoke-Guarded {
     param(
         [string]$File,
@@ -1416,7 +1416,7 @@ try {
 } catch {}
 
 # exit code contract: 0 healthy, 1 reboot-needed, 2 needs-attention
-# stored in $global:PanaceaExit so RMM/scripting can read it; NO exit call so backstage stays alive
+# stored in $global:PanaceaExit so RMM/scripting can read it; NO exit call so the remote shell stays alive
 try { Stop-Transcript -ErrorAction SilentlyContinue | Out-Null } catch {}
 if ($mendResult -eq 'failed' -or $sfcResult -eq 'unfixable' -or $wuStuck) { $global:PanaceaExit = 2 }
 elseif ($rebootNeeded) { $global:PanaceaExit = 1 }
